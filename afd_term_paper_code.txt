@@ -1,0 +1,579 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Mon May  1 13:21:11 2023
+
+@author: agann
+"""
+
+import matplotlib.pyplot as plt
+import numpy as np
+from tqdm import tqdm
+import scipy.sparse.linalg as splinalg
+from scipy import interpolate
+
+
+points = 41
+dom_size = 1.0 
+delta_t= 0.001 
+num_iterations=10
+visc_kinematic = 0.1
+rho = 1.0
+top_velocity = 1.0
+
+pressure_poisson_iteration_number = 50
+safety_factor_stability = 0.5
+
+def main():
+    element_length = dom_size / (points -1)
+    x = np.linspace(0.0, dom_size, points)
+    y = np.linspace(0.0, dom_size, points)
+    
+    X, Y = np.meshgrid(x,y)
+    
+    u_prev = np.zeros_like(X)
+    v_prev = np.zeros_like(X)
+    p_prev = np.zeros_like(X)
+    
+    
+    def central_difference_x(f):
+        diff = np.zeros_like(f)
+        diff[1:-1, 1:-1] = (
+            f[1:-1, 2: ]
+            -
+            f[1:-1, 0:-2]
+        ) / ( 
+            2 * element_length
+        )
+        return diff
+    
+    def central_difference_y(f):
+        diff = np.zeros_like(f)
+        diff[1: -1, 1:-1] = (
+            f[2:  , 1:-1]
+            -
+            f[0:-2, 1:-1]
+        ) / (
+            2 * element_length
+        )
+        return diff
+    
+    def laplace(f):
+        diff = np.zeros_like(f)
+        diff[1: -1, 1:-1] = (
+        f[1:-1, 0:-2]
+        +
+        f[0:-2, 1:-1]
+        -
+        4
+        *
+        f[1:-1, 1:-1]
+        +
+        f[1:-1, 2:]
+        +
+        f[2:, 1:-1]
+        ) / (
+            element_length**2
+        )
+        return diff
+    
+    maximum_possible_time_step_length = (
+        0.5 * element_length**2 / visc_kinematic
+    )
+    if delta_t > safety_factor_stability * maximum_possible_time_step_length:
+        raise RuntimeError("Stability is not guaranteed")
+    
+    for _ in tqdm(range(num_iterations)):
+        #first solving momentum without pressure gradient
+        #defining derivatives of u previous with respect to x
+        #these are all partial derivatives 
+        d_u_prev__d_x = central_difference_x(u_prev)
+        d_u_prev__d_y = central_difference_y(u_prev)
+        d_v_prev__d_x = central_difference_x(v_prev)
+        d_v_prev__d_y = central_difference_y(v_prev)
+        laplace__u_prev = laplace(u_prev)
+        laplace__v_prev = laplace(v_prev)
+        
+        # Perform a tentative step by solving the momentum equation without
+        #the pressure gradient
+        #simple forward Euler method- first order numerical procedure for solving ODE's 
+        u_tent = (
+            u_prev
+            +
+            delta_t * (
+                -
+                (
+                    u_prev * d_u_prev__d_x
+                    +
+                    v_prev * d_u_prev__d_y
+                )
+                +
+                visc_kinematic * laplace__u_prev
+            )
+        )
+        v_tent = (
+            v_prev
+            +
+            delta_t * (
+                -
+                (
+                u_prev * d_v_prev__d_x
+                + 
+                v_prev * d_v_prev__d_y
+                )
+                +
+                visc_kinematic * laplace__v_prev
+            )
+               
+        
+        )
+        # Velocity Boundary Conditions: Homogeneous Dirichlet BC everywhere except
+        #for the horizontal velocity at the top which is prescribed
+        u_tent[0, :] = 0.0
+        u_tent[:, 0] = 0.0
+        #all points in y, last point in x (right boundary)
+        u_tent[:, -1] = 0.0
+        u_tent[-1, :] = top_velocity
+        
+        v_tent[0, :] = 0.0
+        v_tent[:, 0] = 0.0
+        v_tent[:, -1] = 0.0
+        v_tent[-1, :] = 0.0
+        
+        #first step done, tentative velocity, next we need the pressure correction
+        
+        d_u_tent__d_x = central_difference_x(u_tent)
+        d_v_tent__d_y = central_difference_y(v_tent)
+        #here we didn't need mixed derivative b/c we are just evaluating divergence with the divergence
+        
+        #Compute a pressure correction by solving the pressure-poisson equation
+        #the solution to the pressure posison problem is solving a linear system, however here 
+        #we will be using, for simplicity, a smoothing procedure that is approximating the solution to this linear system
+        rhs = (
+            rho / delta_t
+            *
+            (
+                d_u_tent__d_x
+                +
+                d_v_tent__d_y
+            )
+        )
+        
+        for _ in range(pressure_poisson_iteration_number):
+            p_next = np.zeros_like(p_prev)
+            p_next[1:-1, 1:-1] = 1/4 * (
+                +
+                p_prev[1:-1, 0:-2]
+                +
+                p_prev[0:-2, 1:-1]
+                +
+                p_prev[1:-1, 2: ]
+                +
+                p_prev[2: , 1:-1]
+                -
+                element_length**2
+                *
+                rhs[1:-1, 1:-1]
+            )
+            #Pressure Boundary Conditions: Homogeneous Neumann Boundary Conditions everywhere except for the top.
+            #The top is homogeneous Dirichlet BC (prescribing 0 pressure there)
+            #In order to enforce a homonogeous Neumann BC we make sure the derivative across the Boundary is 0 
+            #Therefore we set the boundary condition to the value of the next interior node
+            p_next[:, -1] = p_next[:, -2] #2nd to last element in x direction
+            p_next[0, :] = p_next[1, :]
+            p_next[:, 0] = p_next[:, 1]
+            p_next[-1, :] = 0.0
+            
+            p_prev = p_next
+        
+        #Pressure Poisson equation solved, now onto velocity correction 
+        #For this we need the pressure gradient, so we need the derivatives of the scalar pressure field wrt each of the coordinate axes
+        d_p_next__d_x= central_difference_x(p_next)
+        d_p_next__d_y= central_difference_y(p_next)
+        
+        #Correct the velocities such that the fluid stays incompressible
+        u_next = (
+            u_tent
+            -
+            delta_t / rho
+            *
+            d_p_next__d_x
+        )
+        v_next = (
+            v_tent
+            -
+            delta_t / rho
+            *
+            d_p_next__d_y
+        )
+        
+        # Velocity Boundary Conditions: Homogeneous Dirichlet BC everywhere except
+        #for the horizontal velocity at the top which is prescribed
+        u_next[0, :] = 0.0
+        u_next[:, 0] = 0.0
+        #all points in y, last point in x (right boundary)
+        u_next[:, -1] = 0.0
+        u_next[-1, :] = top_velocity
+        
+        v_next[0, :] = 0.0
+        v_next[:, 0] = 0.0
+        v_next[:, -1] = 0.0
+        v_next[-1, :] = 0.0
+        
+        #Advance in time
+        u_prev = u_next
+        v_prev = v_next
+        p_prev = p_next
+        
+# =============================================================================
+#     plt.figure(figsize=(10, 10))
+#     plt.title("Lid Driven Cavity - Fluid Flow Simulation", fontsize=20, fontweight="bold")
+#     plt.xlabel("x", fontsize=16)
+#     plt.ylabel("y", fontsize=16)
+# 
+#     # Change colormap for the contour plot
+#     contour_fill = plt.contourf(X, Y, p_next, cmap="coolwarm")
+#     plt.colorbar(contour_fill, label="Pressure")
+# 
+#     # Modify the style and color of the streamlines
+# #     plt.quiver(X,Y, u_next, v_next, color="black")
+# 
+#     plt.streamplot(X, Y, u_next, v_next, color="black", linewidth=0.7, density=1.5, arrowstyle='->', arrowsize=1.5)
+# 
+#     # Add grid lines
+#     plt.grid(color="gray", linestyle="--", linewidth=0.5, alpha=0.5)
+# 
+# 
+# # =============================================================================
+#     plt.savefig('Lid_Driven_Cav_high_reynold.png', dpi=600)
+# # =============================================================================
+#     plt.show()
+#     
+# =============================================================================
+    
+    
+#      # Plotting section for quiverplot
+        plt.figure(figsize=(10, 10))
+        plt.title("Lid Driven Cavity - Fluid Flow Simulation", fontsize=20, fontweight="bold")
+        plt.xlabel("x", fontsize=16)
+        plt.ylabel("y", fontsize=16)
+   
+         # Change colormap for the contour plot
+        contour_fill = plt.contourf(X, Y, p_next, cmap="coolwarm")
+        plt.colorbar(contour_fill, label="Pressure")
+
+     # Modify the style and color of the quiver plot
+        skip = 2  # Skip every 'skip' points to reduce arrow density
+        quiver_plot = plt.quiver(X[::skip, ::skip], Y[::skip, ::skip], u_next[::skip, ::skip], v_next[::skip, ::skip],
+                              color="black", scale=20, width=0.003, headwidth=3, headlength=4, minlength=0.1)
+
+     # Add a key to help interpret the arrow lengths
+        plt.quiverkey(quiver_plot, X=0.9, Y=1.05, U=1, label='1 unit/s', labelpos='E', coordinates='axes')
+
+     # Add grid lines
+        plt.grid(color="gray", linestyle="--", linewidth=0.5, alpha=0.5)
+
+        plt.show()
+
+  
+    
+if __name__ == "__main__":
+    main()
+    
+    
+    
+##horizontal stable flow
+
+
+length_domain = 1.0
+num_pts = 41
+time_step_num = 100
+time_step_length = 0.1
+
+viscosity_kin = 0.01
+
+max_iter = None
+
+def forcing_function(time, point):
+    time_decay = np.maximum(
+        2.0 - 0.5 * time,
+        0.0,
+    )
+
+    forced_value = (
+        time_decay
+        *
+        np.where(
+            (
+                (point[0] > 0.1)
+                &
+                (point[0] < 0.3)
+                &
+                (point[1] > 0.4)
+                &
+                (point[1] < 0.6)
+            ),
+            np.array([1.0, 0.0]),   # Direction points to the right
+            np.array([0.0, 0.0]),
+        )
+    )
+
+    return forced_value
+
+
+def main():
+    element_length = length_domain / (num_pts - 1)
+    scalar_shape = (num_pts, num_pts)
+    scalar_dof = num_pts**2
+    vector_shape = (num_pts, num_pts, 2)
+    vector_dof = num_pts**2 * 2
+
+    x = np.linspace(0.0, length_domain, num_pts)
+    y = np.linspace(0.0, length_domain, num_pts)
+
+    # Using "ij" indexing makes the differential operators more logical. Take
+    # care when plotting.
+    X, Y = np.meshgrid(x, y, indexing="ij")
+
+    coordinates = np.concatenate(
+        (
+            X[..., np.newaxis],
+            Y[..., np.newaxis],
+        ),
+        axis=-1,
+    )
+
+    forcing_function_vectorized = np.vectorize(
+        pyfunc=forcing_function,
+        signature="(),(d)->(d)",
+    )
+
+    def partial_derivative_x(field):
+        diff = np.zeros_like(field)
+
+        diff[1:-1, 1:-1] = (
+            (
+                field[2:  , 1:-1]
+                -
+                field[0:-2, 1:-1]
+            ) / (
+                2 * element_length
+            )
+        )
+
+        return diff
+
+    def partial_derivative_y(field):
+        diff = np.zeros_like(field)
+
+        diff[1:-1, 1:-1] = (
+            (
+                field[1:-1, 2:  ]
+                -
+                field[1:-1, 0:-2]
+            ) / (
+                2 * element_length
+            )
+        )
+
+        return diff
+
+    def laplace(field):
+        diff = np.zeros_like(field)
+
+        diff[1:-1, 1:-1] = (
+            (
+                field[0:-2, 1:-1]
+                +
+                field[1:-1, 0:-2]
+                - 4 *
+                field[1:-1, 1:-1]
+                +
+                field[2:  , 1:-1]
+                +
+                field[1:-1, 2:  ]
+            ) / (
+                element_length**2
+            )
+        )
+
+        return diff
+    
+    def divergence(vector_field):
+        divergence_applied = (
+            partial_derivative_x(vector_field[..., 0])
+            +
+            partial_derivative_y(vector_field[..., 1])
+        )
+
+        return divergence_applied
+    
+    def gradient(field):
+        gradient_applied = np.concatenate(
+            (
+                partial_derivative_x(field)[..., np.newaxis],
+                partial_derivative_y(field)[..., np.newaxis],
+            ),
+            axis=-1,
+        )
+
+        return gradient_applied
+    
+    def curl_2d(vector_field):
+        curl_applied = (
+            partial_derivative_x(vector_field[..., 1])
+            -
+            partial_derivative_y(vector_field[..., 0])
+        )
+
+        return curl_applied
+
+    def advect(field, vector_field):
+        backtraced_positions = np.clip(
+            (
+                coordinates
+                -
+                time_step_length
+                *
+                vector_field
+            ),
+            0.0,
+            length_domain,
+        )
+
+        advected_field = interpolate.interpn(
+            points=(x, y),
+            values=field,
+            xi=backtraced_positions,
+        )
+
+        return advected_field
+    
+    def diffusion_operator(vector_field_flattened):
+        vector_field = vector_field_flattened.reshape(vector_shape)
+
+        diffusion_applied = (
+            vector_field
+            -
+            viscosity_kin
+            *
+            time_step_length
+            *
+            laplace(vector_field)
+        )
+
+        return diffusion_applied.flatten()
+    
+    def poisson_operator(field_flattened):
+        field = field_flattened.reshape(scalar_shape)
+
+        poisson_applied = laplace(field)
+
+        return poisson_applied.flatten()
+
+    plt.style.use("dark_background")
+    plt.figure(figsize=(5, 5), dpi=160)
+
+    velocities_prev = np.zeros(vector_shape)
+    
+    time_current = 0.0
+    for i in tqdm(range(time_step_num)):
+        time_current += time_step_length
+
+        forces = forcing_function_vectorized(
+            time_current,
+            coordinates,
+        )
+
+        # (1) Apply Forces
+        velocities_forces_applied = (
+            velocities_prev
+            +
+            time_step_length
+            *
+            forces
+        )
+
+        # (2) Nonlinear convection (=self-advection)
+        velocities_advected = advect(
+            field=velocities_forces_applied,
+            vector_field=velocities_forces_applied,
+        )
+
+        # (3) Diffuse
+        velocities_diffused = splinalg.cg(
+            A=splinalg.LinearOperator(
+                shape=(vector_dof, vector_dof),
+                matvec=diffusion_operator,
+            ),
+            b=velocities_advected.flatten(),
+            maxiter=max_iter,
+        )[0].reshape(vector_shape)
+
+        # (4.1) Compute a pressure correction
+        pressure = splinalg.cg(
+            A=splinalg.LinearOperator(
+                shape=(scalar_dof, scalar_dof),
+                matvec=poisson_operator,
+            ),
+            b=divergence(velocities_diffused).flatten(),
+            maxiter=max_iter,
+        )[0].reshape(scalar_shape)
+
+        # (4.2) Correct the velocities to be incompressible
+        velocities_projected = (
+            velocities_diffused
+            -
+            gradient(pressure)
+        )
+
+        # Advance to next time step
+        velocities_prev = velocities_projected
+
+        # Plot
+        curl = curl_2d(velocities_projected)
+        plt.contourf(
+            X,
+            Y,
+            curl,
+            cmap='PiYG',
+            levels=100,
+        )
+        plt.quiver(
+            X, 
+            Y,
+            velocities_projected[..., 0],
+            velocities_projected[..., 1],
+            color="black",
+        )
+        plt.draw()
+        plt.pause(0.0001)
+        plt.clf()
+        
+# =============================================================================
+#        if i % 10 == 0:
+#             plt.contourf(
+#                X,
+#                Y,
+#                curl,
+#                cmap='PiYG',
+#                levels=100,
+#                )
+#             plt.quiver(
+#                 X,
+#                 Y,
+#                 velocities_projected[..., 0],
+#                 velocities_projected[..., 1],
+#                 color="black",
+#                 )
+#             plt.savefig(f'output_{i}.png', dpi=160)
+#             plt.clf()
+# =============================================================================
+
+    plt.show()
+        
+
+
+if __name__ == "__main__":
+    main()
+    
